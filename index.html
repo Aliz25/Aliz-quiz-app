@@ -1,0 +1,581 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Quiz App</title>
+    <!-- Tailwind CSS CDN -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Inter Font -->
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <!-- React CDN -->
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+    <!-- Babel for JSX transformation -->
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <!-- Firebase CDN -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, getDoc, addDoc, setDoc, updateDoc, deleteDoc, onSnapshot, collection, query, where, arrayUnion, getDocs } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // Global variables provided by Canvas environment
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+        // Initialize Firebase
+        const app = initializeApp(firebaseConfig);
+        const db = getFirestore(app);
+        const auth = getAuth(app);
+
+        // Make globally accessible for the React script
+        window.db = db;
+        window.auth = auth;
+        window.appId = appId;
+        window.arrayUnion = arrayUnion;
+        window.initialAuthToken = initialAuthToken;
+        window.onAuthStateChanged = onAuthStateChanged;
+        window.signInAnonymously = signInAnonymously;
+        window.signInWithCustomToken = signInWithCustomToken;
+        window.collection = collection;
+        window.query = query;
+        window.where = where;
+        window.getDocs = getDocs;
+        window.getDoc = getDoc;
+        window.updateDoc = updateDoc;
+        window.deleteDoc = deleteDoc;
+        window.doc = doc;
+        window.addDoc = addDoc;
+        window.setDoc = setDoc;
+    </script>
+    <style>
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #f3f4f6;
+        }
+        textarea::-webkit-scrollbar { width: 8px; }
+        textarea::-webkit-scrollbar-track { background: #e0e0e0; border-radius: 10px; }
+        textarea::-webkit-scrollbar-thumb { background: #888; border-radius: 10px; }
+        textarea::-webkit-scrollbar-thumb:hover { background: #555; }
+    </style>
+</head>
+<body class="min-h-screen flex items-center justify-center p-4">
+    <div id="root" class="w-full max-w-2xl bg-white rounded-lg shadow-xl p-6 md:p-8"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect, useCallback } = React;
+
+        // Main App Component
+        function App() {
+            const [appState, setAppState] = useState('mainMenu');
+            const [quizName, setQuizName] = useState('');
+            const [questions, setQuestions] = useState([]);
+            const [currentQuestionIndex, setCurrentQuestionIndex] = useState(0);
+            const [userAnswers, setUserAnswers] = useState({});
+            const [score, setScore] = useState(0);
+            const [loading, setLoading] = useState(false);
+            const [loadingMessage, setLoadingMessage] = useState('');
+            const [message, setMessage] = useState('');
+            const [userId, setUserId] = useState(null);
+            const [db, setDb] = useState(null);
+            const [auth, setAuth] = useState(null);
+            const [isAuthReady, setIsAuthReady] = useState(false);
+            const [savedQuizzes, setSavedQuizzes] = useState([]);
+            const [selectedQuizId, setSelectedQuizId] = useState(null);
+            const [confirmDeleteId, setConfirmDeleteId] = useState(null);
+            const [aiFeedback, setAiFeedback] = useState(null);
+            const [shareCode, setShareCode] = useState('');
+
+            // Firebase Initialization and Auth
+            useEffect(() => {
+                if (window.db && window.auth) {
+                    setDb(window.db);
+                    setAuth(window.auth);
+                    const unsubscribe = window.onAuthStateChanged(window.auth, async (user) => {
+                        if (user) {
+                            setUserId(user.uid);
+                        } else {
+                            try {
+                                const cred = window.initialAuthToken ? await window.signInWithCustomToken(window.auth, window.initialAuthToken) : await window.signInAnonymously(window.auth);
+                                setUserId(cred.user.uid);
+                            } catch (error) {
+                                console.error("Firebase Auth Error:", error);
+                                setMessage(`Authentication failed: ${error.message}`);
+                            }
+                        }
+                        setIsAuthReady(true);
+                    });
+                    return () => unsubscribe();
+                }
+            }, []);
+
+            // Function to reset quiz state
+            const resetQuizState = useCallback(() => {
+                setQuizName('');
+                setQuestions([]);
+                setCurrentQuestionIndex(0);
+                setUserAnswers({});
+                setScore(0);
+                setLoading(false);
+                setMessage('');
+                setSelectedQuizId(null);
+                setConfirmDeleteId(null);
+                setAiFeedback(null);
+                setLoadingMessage('');
+                setShareCode('');
+            }, []);
+            
+            // Helper to format questions array back to editable text
+            const formatQuestionsForEditing = (questionsArray) => {
+                if (!Array.isArray(questionsArray)) return '';
+                return questionsArray.map((q, index) => {
+                    const questionText = `${index + 1}. ${q.question}`;
+                    const optionsText = q.options.map(opt => {
+                        const isCorrect = typeof opt === 'string' && typeof q.correctAnswer === 'string' && opt.trim() === q.correctAnswer.trim();
+                        const prefix = isCorrect ? '*' : '';
+                        return `${prefix}${opt}`;
+                    }).join('\n');
+                    return `${questionText}\n${optionsText}`;
+                }).join('\n\n');
+            };
+
+            // Generic Gemini API call function
+            const callGeminiAPI = async (prompt, responseSchema) => {
+                const apiKey = ""; // Provided by Canvas
+                const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`;
+                const payload = { contents: [{ role: "user", parts: [{ text: prompt }] }] };
+                if (responseSchema) {
+                    payload.generationConfig = { responseMimeType: "application/json", responseSchema: responseSchema };
+                }
+                const response = await fetch(apiUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+                if (!response.ok) {
+                    const errorData = await response.json();
+                    throw new Error(`API error: ${response.status} - ${errorData.error.message || 'Unknown error'}`);
+                }
+                const result = await response.json();
+                return JSON.parse(result.candidates[0].content.parts[0].text);
+            };
+
+            // Handle generating questions with Gemini
+            const handleGenerateQuestions = async (topic) => {
+                if (!topic.trim()) { setMessage('Please enter a topic.'); return; }
+                setLoading(true); setLoadingMessage('✨ Generating questions with AI...'); setMessage('');
+                try {
+                    const generationPrompt = `Generate a JSON array of 5 quiz question objects on the topic "${topic}". Each object must have "question" (string), "options" (array of 4 strings), and "correctAnswer" (string, the exact text of one of the options).`;
+                    const schema = { type: "ARRAY", items: { type: "OBJECT", properties: { question: { type: "STRING" }, options: { type: "ARRAY", items: { type: "STRING" } }, correctAnswer: { type: "STRING" } }, required: ["question", "options", "correctAnswer"] } };
+                    const parsedData = await callGeminiAPI(generationPrompt, schema);
+                    if (Array.isArray(parsedData) && parsedData.length > 0) {
+                        setQuestions(parsedData);
+                        if (!quizName) setQuizName(`Quiz on ${topic}`);
+                        setMessage('✨ AI-generated quiz is ready! Click "Save Quiz" to continue.');
+                    } else {
+                        setMessage('AI failed to generate a valid quiz. Please try again.');
+                    }
+                } catch (error) {
+                    console.error("Question generation error:", error);
+                    setMessage(`Error generating questions: ${error.message}.`);
+                } finally {
+                    setLoading(false); setLoadingMessage('');
+                }
+            };
+
+            // Handle getting feedback with Gemini
+            const handleGetFeedback = async () => {
+                const incorrectAnswers = questions.map((q, i) => ({...q, userAnswer: userAnswers[i]})).filter((q, i) => userAnswers[i] !== q.correctAnswer);
+                if (incorrectAnswers.length === 0) { setAiFeedback({ message: "Great job! You answered all questions correctly." }); return; }
+                setLoading(true); setLoadingMessage('✨ Generating feedback with AI...');
+                try {
+                    const prompt = `For each of the following incorrectly answered questions, provide a brief, helpful explanation for why the correct answer is right.\n\n${incorrectAnswers.map(q => `Question: "${q.question}"\nYour Answer: "${q.userAnswer}"\nCorrect Answer: "${q.correctAnswer}"`).join('\n\n')}`;
+                    const schema = { type: "OBJECT", properties: { feedback: { type: "ARRAY", items: { type: "OBJECT", properties: { question: { type: "STRING" }, explanation: { type: "STRING" } }, required: ["question", "explanation"] } } } };
+                    const result = await callGeminiAPI(prompt, schema);
+                    setAiFeedback(result);
+                } catch (error) {
+                    console.error("Feedback generation error:", error);
+                    setMessage(`Error generating feedback: ${error.message}.`);
+                } finally {
+                    setLoading(false); setLoadingMessage('');
+                }
+            };
+
+            // Handle parsing quiz content from text
+            const handleParseQuiz = async (rawQuizText) => {
+                if (!quizName.trim()) { setMessage('Please provide a Quiz Name.'); return; }
+                if (!rawQuizText.trim()) { setMessage('Please paste quiz content to parse.'); return; }
+                setLoading(true); setLoadingMessage('Parsing your quiz...'); setMessage('');
+                try {
+                    const prompt = `Parse the following quiz content into a JSON array of question objects. Each object should have 'question' (string), 'options' (array of strings without the asterisk), and 'correctAnswer' (string, the exact text of the correct option). The correct answer is marked with an asterisk (*). Ensure the JSON is valid. If a question has no asterisked answer, exclude it.\n\nQuiz Content:\n\n` + rawQuizText;
+                    const schema = { type: "ARRAY", items: { type: "OBJECT", properties: { question: { type: "STRING" }, options: { type: "ARRAY", items: { type: "STRING" } }, correctAnswer: { type: "STRING" } }, required: ["question", "options", "correctAnswer"] } };
+                    const parsedData = await callGeminiAPI(prompt, schema);
+                    if (Array.isArray(parsedData) && parsedData.length > 0) {
+                        setQuestions(parsedData);
+                        setMessage('Quiz parsed successfully! Click "Save Quiz" to continue.');
+                    } else {
+                        setMessage('Failed to parse quiz. Please check the format.');
+                    }
+                } catch (error) {
+                    console.error("Parsing error:", error);
+                    setMessage(`Error parsing quiz: ${error.message}.`);
+                } finally {
+                    setLoading(false); setLoadingMessage('');
+                }
+            };
+
+            // Handle saving or updating quiz to Firestore
+            const handleSaveQuiz = async () => {
+                if (!db || !userId || questions.length === 0 || !quizName.trim()) { setMessage('Cannot save: Missing data, questions, or quiz name.'); return; }
+                setLoading(true); setMessage('');
+                try {
+                    const data = { quizName: quizName, questions: questions, timestamp: new Date().toISOString(), userId: userId };
+                    if (selectedQuizId) {
+                        const quizDocRef = window.doc(db, `/artifacts/${window.appId}/users/${userId}/quizzes`, selectedQuizId);
+                        await window.updateDoc(quizDocRef, data);
+                    } else {
+                        const quizzesCollectionRef = window.collection(db, `/artifacts/${window.appId}/users/${userId}/quizzes`);
+                        data.userAttempts = [];
+                        const newDocRef = await window.addDoc(quizzesCollectionRef, data);
+                        setSelectedQuizId(newDocRef.id);
+                    }
+                    setAppState('postSaveChoice');
+                } catch (error) {
+                    console.error("Error saving quiz:", error);
+                    setMessage(`Error saving quiz: ${error.message}`);
+                } finally {
+                    setLoading(false);
+                }
+            };
+
+            // Handle sharing a quiz
+            const handleShareQuiz = async (quiz) => {
+                if (!db) return;
+                setLoading(true);
+                try {
+                    const code = Math.random().toString(36).substring(2, 8).toUpperCase();
+                    // CORRECTED PATH: Added /data/ segment
+                    const shareDocRef = window.doc(db, `/artifacts/${window.appId}/public/data/sharedQuizzes`, code);
+                    await window.setDoc(shareDocRef, {
+                        quizName: quiz.quizName,
+                        questions: quiz.questions,
+                        originalAuthor: userId,
+                        sharedAt: new Date().toISOString()
+                    });
+                    setShareCode(code);
+                    setMessage(`Quiz shared! Code: ${code}`);
+                } catch (error) {
+                    console.error("Error sharing quiz:", error);
+                    setMessage(`Error sharing quiz: ${error.message}`);
+                } finally {
+                    setLoading(false);
+                }
+            };
+
+            // Handle joining a shared quiz
+            const handleJoinQuiz = async (code) => {
+                if (!db || !code.trim()) { setMessage("Please enter a valid share code."); return; }
+                setLoading(true);
+                setMessage('');
+                try {
+                    // CORRECTED PATH: Added /data/ segment
+                    const shareDocRef = window.doc(db, `/artifacts/${window.appId}/public/data/sharedQuizzes`, code.trim().toUpperCase());
+                    const docSnap = await window.getDoc(shareDocRef);
+                    if (docSnap.exists()) {
+                        const quizData = docSnap.data();
+                        resetQuizState();
+                        setQuizName(quizData.quizName);
+                        setQuestions(quizData.questions);
+                        // Note: We don't set selectedQuizId because this is a temporary, shared quiz. Scores won't be saved to the original.
+                        setAppState('takeQuiz');
+                    } else {
+                        setMessage("Invalid share code. Please check and try again.");
+                    }
+                } catch (error) {
+                    console.error("Error joining quiz:", error);
+                    setMessage(`Error joining quiz: ${error.message}`);
+                } finally {
+                    setLoading(false);
+                }
+            };
+            
+            // Handle deleting a quiz from Firestore
+            const handleDeleteQuiz = async (quizId) => {
+                if (!db || !userId) return;
+                setLoading(true);
+                try {
+                    const quizDocRef = window.doc(db, `/artifacts/${window.appId}/users/${userId}/quizzes`, quizId);
+                    await window.deleteDoc(quizDocRef);
+                    setSavedQuizzes(prev => prev.filter(q => q.id !== quizId));
+                    setMessage('Quiz deleted successfully.');
+                    setConfirmDeleteId(null);
+                } catch (error) {
+                    console.error("Error deleting quiz:", error);
+                    setMessage(`Error deleting quiz: ${error.message}`);
+                } finally {
+                    setLoading(false);
+                }
+            };
+
+            // Handle loading quizzes from Firestore
+            const handleLoadQuizzes = async () => {
+                if (!db || !userId) return;
+                setLoading(true); setMessage(''); setSavedQuizzes([]);
+                try {
+                    const quizzesCollectionRef = window.collection(db, `/artifacts/${window.appId}/users/${userId}/quizzes`);
+                    const q = window.query(quizzesCollectionRef, window.where("userId", "==", userId));
+                    const querySnapshot = await window.getDocs(q);
+                    const loadedQuizzes = [];
+                    querySnapshot.forEach((doc) => loadedQuizzes.push({ id: doc.id, ...doc.data() }));
+                    setSavedQuizzes(loadedQuizzes);
+                    setMessage(loadedQuizzes.length > 0 ? 'Quizzes loaded.' : 'No saved quizzes found.');
+                } catch (error) {
+                    console.error("Error loading quizzes:", error);
+                    setMessage(`Error loading quizzes: ${error.message}`);
+                } finally {
+                    setLoading(false);
+                }
+            };
+
+            useEffect(() => {
+                if (appState === 'loadQuiz' && isAuthReady && userId) {
+                    handleLoadQuizzes();
+                }
+            }, [appState, isAuthReady, userId]);
+
+            const handleAnswerSelection = (option) => setUserAnswers(prev => ({ ...prev, [currentQuestionIndex]: option }));
+            const handleNextQuestion = () => currentQuestionIndex < questions.length - 1 ? setCurrentQuestionIndex(prev => prev + 1) : handleSubmitQuiz();
+            const handlePreviousQuestion = () => currentQuestionIndex > 0 && setCurrentQuestionIndex(prev => prev - 1);
+
+            // Handles quiz submission and auto-saving
+            const handleSubmitQuiz = async () => {
+                let correctCount = questions.reduce((acc, q, index) => acc + (userAnswers[index] === q.correctAnswer ? 1 : 0), 0);
+                setScore(correctCount);
+                setAppState('results');
+
+                // Only save attempt if it was a quiz loaded from storage (has selectedQuizId)
+                if (db && userId && selectedQuizId) {
+                    try {
+                        const attemptData = {
+                            attemptId: crypto.randomUUID(),
+                            timestamp: new Date().toISOString(),
+                            score: correctCount,
+                            totalQuestions: questions.length,
+                            userAnswers: Object.keys(userAnswers).map(index => ({ questionIndex: parseInt(index), selectedOption: userAnswers[index] }))
+                        };
+                        const quizDocRef = window.doc(db, `/artifacts/${window.appId}/users/${userId}/quizzes`, selectedQuizId);
+                        await window.updateDoc(quizDocRef, { userAttempts: window.arrayUnion(attemptData) });
+                        setMessage('Score saved successfully!');
+                    } catch (error) {
+                        console.error("Error during quiz submission/saving:", error);
+                        setMessage(`Error saving attempt: ${error.message}`);
+                    }
+                }
+            };
+            
+            const HomeButton = () => <button onClick={() => { resetQuizState(); setAppState('mainMenu'); }} className="px-4 py-2 bg-gray-200 text-gray-800 font-semibold rounded-lg shadow-sm hover:bg-gray-300 transition">Home</button>;
+
+            const MainMenu = () => (
+                <div className="flex flex-col items-center justify-center space-y-4">
+                    <h1 className="text-3xl font-bold text-gray-800 mb-6">AI Quiz Application</h1>
+                    <button onClick={() => { resetQuizState(); setAppState('createQuiz'); }} className="w-full md:w-2/3 px-6 py-3 bg-blue-600 text-white font-semibold rounded-lg shadow-md hover:bg-blue-700 transition">Create New Quiz</button>
+                    <button onClick={() => { resetQuizState(); setAppState('loadQuiz'); }} className="w-full md:w-2/3 px-6 py-3 bg-green-600 text-white font-semibold rounded-lg shadow-md hover:bg-green-700 transition">Load My Quizzes</button>
+                    <button onClick={() => { resetQuizState(); setAppState('joinQuiz'); }} className="w-full md:w-2/3 px-6 py-3 bg-orange-500 text-white font-semibold rounded-lg shadow-md hover:bg-orange-600 transition">Join a Shared Quiz</button>
+                    {userId && <p className="text-sm text-gray-500 mt-4">Your User ID: <span className="font-mono bg-gray-100 p-1 rounded">{userId}</span></p>}
+                </div>
+            );
+
+            const CreateQuiz = () => {
+                const [rawQuizText, setRawQuizText] = useState(() => selectedQuizId ? formatQuestionsForEditing(questions) : '');
+                const [aiTopic, setAiTopic] = useState('');
+                const isEditing = !!selectedQuizId;
+
+                useEffect(() => {
+                    if (questions.length > 0) {
+                        setRawQuizText(formatQuestionsForEditing(questions));
+                    }
+                }, [questions]);
+
+                return (
+                    <div className="flex flex-col space-y-4">
+                        <div className="flex justify-between items-center mb-2">
+                            <h2 className="text-2xl font-semibold text-gray-800">{isEditing ? 'Edit Quiz' : 'Create New Quiz'}</h2>
+                            <HomeButton />
+                        </div>
+                        <div className="border p-4 rounded-lg bg-gray-50">
+                            <h3 className="text-lg font-semibold text-gray-700 mb-2">✨ AI Question Generator</h3>
+                            <input type="text" placeholder="Enter a topic (e.g., 'Solar System')" value={aiTopic} onChange={(e) => setAiTopic(e.target.value)} className="w-full p-2 border border-gray-300 rounded-lg"/>
+                            <button onClick={() => handleGenerateQuestions(aiTopic)} disabled={loading || !aiTopic.trim()} className="mt-2 w-full px-6 py-2 bg-teal-500 text-white font-semibold rounded-lg shadow-md hover:bg-teal-600 disabled:opacity-50">Generate Quiz</button>
+                        </div>
+                        <div className="text-center font-semibold text-gray-500">OR</div>
+                        <div className="border p-4 rounded-lg bg-gray-50">
+                           <h3 className="text-lg font-semibold text-gray-700 mb-2">Manual Entry</h3>
+                            <input type="text" placeholder="Enter Quiz Name" value={quizName} onChange={(e) => setQuizName(e.target.value)} className="w-full p-3 border border-gray-300 rounded-lg"/>
+                            <textarea placeholder="Paste your quiz content here, with correct answers marked by *..." value={rawQuizText} onChange={(e) => setRawQuizText(e.target.value)} rows="8" className="mt-2 w-full p-3 border border-gray-300 rounded-lg resize-y"></textarea>
+                            <button onClick={() => handleParseQuiz(rawQuizText)} disabled={loading || !quizName.trim() || !rawQuizText.trim()} className="mt-2 w-full px-6 py-2 bg-purple-600 text-white font-semibold rounded-lg shadow-md hover:bg-purple-700 disabled:opacity-50">Parse Text</button>
+                        </div>
+                        <button onClick={handleSaveQuiz} disabled={loading || questions.length === 0 || !quizName.trim()} className="w-full px-6 py-3 bg-indigo-600 text-white font-semibold rounded-lg shadow-md hover:bg-indigo-700 disabled:opacity-50 flex items-center justify-center">
+                            {loading ? 'Saving...' : (isEditing ? 'Update Quiz' : 'Save Quiz')}
+                        </button>
+                        {message && <p className={`text-center mt-2 ${message.includes('Error') ? 'text-red-500' : 'text-green-600'}`}>{message}</p>}
+                    </div>
+                );
+            };
+
+            const PostSaveChoice = () => (
+                <div className="flex flex-col items-center justify-center space-y-4 text-center">
+                    <svg xmlns="http://www.w3.org/2000/svg" className="h-16 w-16 text-green-500" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
+                    </svg>
+                    <h2 className="text-2xl font-semibold text-gray-800">Quiz Saved Successfully!</h2>
+                    <p className="text-gray-600">What would you like to do next?</p>
+                    <button onClick={() => setAppState('takeQuiz')} className="w-full md:w-2/3 px-6 py-3 bg-blue-600 text-white font-semibold rounded-lg shadow-md hover:bg-blue-700 transition">Run This Quiz</button>
+                    <button onClick={() => { resetQuizState(); setAppState('createQuiz'); }} className="w-full md:w-2/3 px-6 py-3 bg-gray-300 text-gray-800 font-semibold rounded-lg shadow-md hover:bg-gray-400 transition">Create Another Quiz</button>
+                </div>
+            );
+
+            const QuizTaking = () => {
+                if (questions.length === 0) return <div className="text-center text-gray-600">No questions loaded.</div>;
+                const currentQuestion = questions[currentQuestionIndex];
+                const progressPercentage = questions.length > 0 ? ((currentQuestionIndex + 1) / questions.length) * 100 : 0;
+                return (
+                    <div className="flex flex-col space-y-6">
+                        <div className="w-full bg-gray-200 rounded-full h-2.5 dark:bg-gray-700">
+                            <div className="bg-blue-600 h-2.5 rounded-full transition-all duration-500" style={{width: `${progressPercentage}%`}}></div>
+                        </div>
+                        <h2 className="text-2xl font-semibold text-gray-800 text-center">{quizName}</h2>
+                        <div className="text-lg font-medium text-gray-700">Question {currentQuestionIndex + 1} of {questions.length}</div>
+                        <p className="text-xl font-bold text-gray-900 bg-blue-50 p-4 rounded-lg shadow-sm">{currentQuestion.question}</p>
+                        <div className="flex flex-col space-y-3">
+                            {currentQuestion.options.map((option, index) => (
+                                <label key={index} className="flex items-center p-3 border border-gray-300 rounded-lg cursor-pointer hover:bg-gray-50">
+                                    <input type="radio" name={`q-${currentQuestionIndex}`} value={option} checked={userAnswers[currentQuestionIndex] === option} onChange={() => handleAnswerSelection(option)} className="form-radio h-5 w-5 text-blue-600"/>
+                                    <span className="ml-3 text-lg text-gray-800">{option}</span>
+                                </label>
+                            ))}
+                        </div>
+                        <div className="flex justify-between mt-6">
+                            <button onClick={handlePreviousQuestion} disabled={currentQuestionIndex === 0} className="px-6 py-3 bg-gray-400 text-white font-semibold rounded-lg shadow-md hover:bg-gray-500 disabled:opacity-50">Previous</button>
+                            <button onClick={handleNextQuestion} disabled={userAnswers[currentQuestionIndex] === undefined} className="px-6 py-3 bg-blue-600 text-white font-semibold rounded-lg shadow-md hover:bg-blue-700 disabled:opacity-50">
+                                {currentQuestionIndex === questions.length - 1 ? 'Submit' : 'Next'}
+                            </button>
+                        </div>
+                    </div>
+                );
+            };
+
+            const QuizResults = () => (
+                <div className="flex flex-col space-y-6">
+                    <div className="flex justify-between items-center">
+                        <h2 className="text-3xl font-bold text-gray-800">Quiz Results</h2>
+                        <HomeButton />
+                    </div>
+                    <p className="text-2xl font-semibold text-center text-blue-700">Your Score: {score} / {questions.length}</p>
+                    {message && <p className={`text-center mt-2 ${message.includes('Error') ? 'text-red-500' : 'text-green-600'}`}>{message}</p>}
+                    {!aiFeedback && (
+                        <button onClick={handleGetFeedback} disabled={loading} className="w-full px-6 py-3 bg-teal-500 text-white font-semibold rounded-lg shadow-md hover:bg-teal-600 disabled:opacity-50 flex items-center justify-center">
+                            ✨ Get AI Feedback on Incorrect Answers
+                        </button>
+                    )}
+                    {aiFeedback && (
+                        <div className="border p-4 rounded-lg bg-gray-50">
+                            <h3 className="text-xl font-semibold text-gray-800 mb-3">✨ AI Feedback</h3>
+                            {aiFeedback.message && <p className="text-green-700">{aiFeedback.message}</p>}
+                            {aiFeedback.feedback && aiFeedback.feedback.map((fb, index) => (
+                                <div key={index} className="mt-3 pt-3 border-t">
+                                    <p className="font-bold text-gray-800">{fb.question}</p>
+                                    <p className="text-gray-600 mt-1">{fb.explanation}</p>
+                                </div>
+                            ))}
+                        </div>
+                    )}
+                    <div className="space-y-6 max-h-96 overflow-y-auto p-2">
+                        {questions.map((q, index) => (
+                            <div key={index} className={`p-4 rounded-lg shadow-md ${userAnswers[index] === q.correctAnswer ? 'bg-green-50' : 'bg-red-50'}`}>
+                                <p className="font-bold text-lg text-gray-900 mb-2">Q{index + 1}: {q.question}</p>
+                                <p className="text-sm text-green-700">Correct Answer: {q.correctAnswer}</p>
+                                <p className={`text-sm ${userAnswers[index] === q.correctAnswer ? 'text-gray-600' : 'text-red-700'}`}>Your Answer: {userAnswers[index] || 'No answer'}</p>
+                            </div>
+                        ))}
+                    </div>
+                </div>
+            );
+
+            const LoadQuiz = () => {
+                const startEditQuiz = (quiz) => { resetQuizState(); setSelectedQuizId(quiz.id); setQuizName(quiz.quizName); setQuestions(quiz.questions); setAppState('createQuiz'); };
+                return (
+                    <div className="flex flex-col space-y-4">
+                        <div className="flex justify-between items-center mb-2">
+                            <h2 className="text-2xl font-semibold text-gray-800">Load My Quizzes</h2>
+                            <HomeButton />
+                        </div>
+                        {loading && <p className="text-center">Loading quizzes...</p>}
+                        {message && !loading && <p className={`text-center ${shareCode ? 'text-green-600' : ''}`}>{message}</p>}
+                        {shareCode && (
+                            <div className="p-4 bg-green-100 border border-green-400 text-green-800 rounded-lg text-center">
+                                Quiz Share Code: <strong className="font-mono">{shareCode}</strong>
+                            </div>
+                        )}
+                        <ul className="space-y-3">
+                            {savedQuizzes.map(quiz => (
+                                <li key={quiz.id} className="p-4 border border-gray-200 rounded-lg shadow-sm bg-white">
+                                    <div className="flex justify-between items-center">
+                                        <div onClick={() => { setSelectedQuizId(quiz.id); setQuizName(quiz.quizName); setQuestions(quiz.questions); setAppState('takeQuiz'); }} className="cursor-pointer flex-grow pr-4">
+                                            <p className="font-semibold text-lg text-gray-800">{quiz.quizName}</p>
+                                            <p className="text-sm text-gray-500">Saved: {new Date(quiz.timestamp).toLocaleString()}</p>
+                                        </div>
+                                        <div className="flex-shrink-0 flex items-center space-x-2">
+                                            <button onClick={() => handleShareQuiz(quiz)} className="px-3 py-1 text-sm bg-blue-500 text-white rounded-md hover:bg-blue-600">Share</button>
+                                            {confirmDeleteId === quiz.id ? (
+                                                <>
+                                                    <button onClick={() => handleDeleteQuiz(quiz.id)} className="px-3 py-1 text-sm bg-red-600 text-white rounded-md hover:bg-red-700">Confirm</button>
+                                                    <button onClick={() => setConfirmDeleteId(null)} className="px-3 py-1 text-sm bg-gray-400 text-white rounded-md hover:bg-gray-500">Cancel</button>
+                                                </>
+                                            ) : (
+                                                <>
+                                                    <button onClick={() => startEditQuiz(quiz)} className="px-3 py-1 text-sm bg-yellow-500 text-white rounded-md hover:bg-yellow-600">Edit</button>
+                                                    <button onClick={() => setConfirmDeleteId(quiz.id)} className="px-3 py-1 text-sm bg-red-500 text-white rounded-md hover:bg-red-600">Delete</button>
+                                                </>
+                                            )}
+                                        </div>
+                                    </div>
+                                </li>
+                            ))}
+                        </ul>
+                    </div>
+                );
+            };
+
+            const JoinQuiz = () => {
+                const [joinCode, setJoinCode] = useState('');
+                return (
+                    <div className="flex flex-col space-y-4">
+                        <div className="flex justify-between items-center mb-2">
+                            <h2 className="text-2xl font-semibold text-gray-800">Join a Shared Quiz</h2>
+                            <HomeButton />
+                        </div>
+                        <input type="text" placeholder="Enter Share Code" value={joinCode} onChange={(e) => setJoinCode(e.target.value.toUpperCase())} className="w-full p-3 border border-gray-300 rounded-lg uppercase" />
+                        <button onClick={() => handleJoinQuiz(joinCode)} disabled={loading || !joinCode.trim()} className="w-full px-6 py-3 bg-orange-500 text-white font-semibold rounded-lg shadow-md hover:bg-orange-600 disabled:opacity-50">Join Quiz</button>
+                        {message && <p className={`text-center mt-2 ${message.includes('Error') || message.includes('Invalid') ? 'text-red-500' : 'text-green-600'}`}>{message}</p>}
+                    </div>
+                );
+            };
+
+            const renderState = () => {
+                if (!isAuthReady) return <div className="text-center p-10">Initializing application...</div>;
+                if (loading) return <div className="text-center p-10">{loadingMessage || 'Loading...'}</div>;
+                switch (appState) {
+                    case 'createQuiz': return <CreateQuiz />;
+                    case 'takeQuiz': return <QuizTaking />;
+                    case 'results': return <QuizResults />;
+                    case 'loadQuiz': return <LoadQuiz />;
+                    case 'joinQuiz': return <JoinQuiz />;
+                    case 'postSaveChoice': return <PostSaveChoice />;
+                    default: return <MainMenu />;
+                }
+            };
+
+            return <div className="relative w-full">{renderState()}</div>;
+        }
+
+        ReactDOM.render(<App />, document.getElementById('root'));
+    </script>
+</body>
+</html>
