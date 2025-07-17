@@ -21,7 +21,15 @@
 
         // Global variables provided by Canvas environment
         const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
-        const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+        const firebaseConfig = {
+    apiKey: "AIzaSyBEEcxhzfEjRVNSpE452OgskMfknyDA2P8",
+    authDomain: "aliz-quiz-app.firebaseapp.com",
+    projectId: "aliz-quiz-app",
+    storageBucket: "aliz-quiz-app.firebasestorage.app",
+    messagingSenderId: "327801841099",
+    appId: "1:327801841099:web:a233a696b1835cd593c24e",
+    measurementId: "G-EX5JTF20XM"
+  };
         const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
 
         // Initialize Firebase
